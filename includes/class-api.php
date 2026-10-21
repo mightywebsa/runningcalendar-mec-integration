@@ -18,7 +18,9 @@ class RunningSA_MEC_API {
 	 * Fetch all upcoming events for one province (all pages).
 	 *
 	 * @param string $province Province slug, e.g. free-state.
-	 * @return array|WP_Error List of event arrays.
+	 * @return array|WP_Error {events: array, complete: bool} or an error.
+	 *                        complete is false when pagination stopped early, so the
+	 *                        caller must not treat missing ids as removed races.
 	 */
 	public static function get_events_for_province( $province ) {
 		$api_key = runningsa_mec_get_api_key();
@@ -26,8 +28,9 @@ class RunningSA_MEC_API {
 			return new WP_Error( 'runningsa_no_key', __( 'No API key set.', 'running-sa-mec' ) );
 		}
 
-		$events = array();
-		$page   = 1;
+		$events   = array();
+		$page     = 1;
+		$complete = true;
 		do {
 			$body = self::request( $api_key, $province, $page );
 			if ( is_wp_error( $body ) ) {
@@ -38,12 +41,120 @@ class RunningSA_MEC_API {
 			}
 			$has_next = ! empty( $body['links']['next'] );
 			$page++;
+			if ( $has_next && $page > self::MAX_PAGES ) {
+				$complete = false;
+				break;
+			}
 			if ( $has_next ) {
 				sleep( 1 ); // Be gentle: limit is 60 requests/minute.
 			}
-		} while ( $has_next && $page <= self::MAX_PAGES );
+		} while ( $has_next );
 
-		return $events;
+		return array(
+			'events'   => $events,
+			'complete' => $complete,
+		);
+	}
+
+	/**
+	 * Changes since a checkpoint. Includes races that are no longer public.
+	 *
+	 * A removed item has sync_status "removed" and only id, slug, sync_status
+	 * and updated_at. Browse filters are ignored in this mode.
+	 *
+	 * @param string $updated_since ISO-8601 timestamp.
+	 * @return array|WP_Error {events: array, complete: bool, max_updated_at: string}
+	 */
+	public static function get_updated_since( $updated_since ) {
+		$api_key = runningsa_mec_get_api_key();
+		if ( '' === $api_key ) {
+			return new WP_Error( 'runningsa_no_key', __( 'No API key set.', 'running-sa-mec' ) );
+		}
+
+		$events   = array();
+		$page     = 1;
+		$complete = true;
+		$max      = '';
+		do {
+			$url  = add_query_arg(
+				array(
+					'updated_since' => $updated_since,
+					'per_page'      => self::PER_PAGE,
+					'page'          => (int) $page,
+				),
+				self::BASE_URL
+			);
+			$body = self::get_json( $api_key, $url );
+			if ( is_wp_error( $body ) ) {
+				return $body;
+			}
+			if ( isset( $body['data'] ) && is_array( $body['data'] ) ) {
+				foreach ( $body['data'] as $event ) {
+					$events[] = $event;
+					if ( ! empty( $event['updated_at'] ) && (string) $event['updated_at'] > $max ) {
+						$max = (string) $event['updated_at'];
+					}
+				}
+			}
+			$has_next = ! empty( $body['links']['next'] );
+			$page++;
+			if ( $has_next && $page > self::MAX_PAGES ) {
+				$complete = false;
+				break;
+			}
+			if ( $has_next ) {
+				sleep( 1 );
+			}
+		} while ( $has_next );
+
+		return array(
+			'events'         => $events,
+			'complete'       => $complete,
+			'max_updated_at' => $max,
+		);
+	}
+
+	/**
+	 * Fetch one event edition by slug or numeric id.
+	 *
+	 * @param string $id_or_slug Slug or id, already validated.
+	 * @return array|WP_Error Event array.
+	 */
+	public static function get_event( $id_or_slug ) {
+		$api_key = runningsa_mec_get_api_key();
+		if ( '' === $api_key ) {
+			return new WP_Error( 'runningsa_no_key', __( 'No API key set.', 'running-sa-mec' ) );
+		}
+
+		$body = self::get_json( $api_key, self::BASE_URL . '/' . rawurlencode( $id_or_slug ) );
+		if ( is_wp_error( $body ) ) {
+			if ( 'runningsa_http_404' === $body->get_error_code() ) {
+				return new WP_Error( 'runningsa_not_found', __( 'No upcoming race was found for that slug.', 'running-sa-mec' ) );
+			}
+			return $body;
+		}
+		if ( empty( $body['data'] ) || ! is_array( $body['data'] ) ) {
+			return new WP_Error( 'runningsa_not_found', __( 'No upcoming race was found for that slug.', 'running-sa-mec' ) );
+		}
+		return $body['data'];
+	}
+
+	/**
+	 * Turn a pasted slug or Running Calendar event URL into an API slug.
+	 *
+	 * @param string $raw User input.
+	 * @return string Empty when it is not a slug.
+	 */
+	public static function normalize_slug( $raw ) {
+		$raw = trim( (string) $raw );
+		if ( preg_match( '#runningcalendar\.co\.za/events/([A-Za-z0-9-]+)#i', $raw, $matches ) ) {
+			$raw = $matches[1];
+		}
+		$raw = strtolower( $raw );
+		if ( ! preg_match( '/^[a-z0-9]+(?:-[a-z0-9]+)*$/', $raw ) || strlen( $raw ) > 120 ) {
+			return '';
+		}
+		return $raw;
 	}
 
 	/**
@@ -65,6 +176,17 @@ class RunningSA_MEC_API {
 			self::BASE_URL
 		);
 
+		return self::get_json( $api_key, $url );
+	}
+
+	/**
+	 * GET a URL and decode the JSON body. Successful responses are cached.
+	 *
+	 * @param string $api_key Key (sent as Bearer token, never logged).
+	 * @param string $url     Full request URL.
+	 * @return array|WP_Error
+	 */
+	private static function get_json( $api_key, $url ) {
 		$cache_key = 'runningsa_mec_' . md5( $url );
 		$cached    = get_transient( $cache_key );
 		if ( is_array( $cached ) ) {

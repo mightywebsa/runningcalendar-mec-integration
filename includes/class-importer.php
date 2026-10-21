@@ -13,9 +13,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class RunningSA_MEC_Importer {
 
-	const META_ID   = '_runningsa_id';   // RunningCalendar event id (dedupe key).
-	const META_URL  = '_runningsa_url';  // Their canonical url, unchanged.
-	const META_HASH = '_runningsa_hash'; // Hash of the API data, to skip unchanged events.
+	const META_ID       = '_runningsa_id';       // RunningCalendar event id (dedupe key).
+	const META_URL      = '_runningsa_url';      // Their canonical url, unchanged.
+	const META_HASH     = '_runningsa_hash';     // Hash of the API data, to skip unchanged events.
+	const META_PROVINCE = '_runningsa_province'; // Province slug this event was imported from.
+	const META_SLUG     = '_runningsa_slug';     // RunningCalendar slug.
+	const META_CLOSED   = '_runningsa_closed';   // We marked this MEC event cancelled.
 
 	/**
 	 * Run one import of all selected provinces.
@@ -32,6 +35,7 @@ class RunningSA_MEC_Importer {
 			'skipped'  => 0,
 			'errors'   => array(),
 			'fetched'  => 0,
+			'closed'   => 0,
 		);
 
 		if ( ! runningsa_mec_is_mec_active() ) {
@@ -57,11 +61,15 @@ class RunningSA_MEC_Importer {
 			if ( $i > 0 ) {
 				sleep( 1 ); // One call per province, spaced out for the rate limit.
 			}
-			$events = RunningSA_MEC_API::get_events_for_province( $province );
-			if ( is_wp_error( $events ) ) {
-				$status['errors'][] = $province . ': ' . $events->get_error_message();
-				RunningSA_MEC_Logger::log( $province . ': ' . $events->get_error_message(), 'error', true );
+			$result = RunningSA_MEC_API::get_events_for_province( $province );
+			if ( is_wp_error( $result ) ) {
+				$status['errors'][] = $province . ': ' . $result->get_error_message();
+				RunningSA_MEC_Logger::log( $province . ': ' . $result->get_error_message(), 'error', true );
 				continue;
+			}
+			$events = isset( $result['events'] ) ? $result['events'] : array();
+			if ( empty( $result['complete'] ) ) {
+				RunningSA_MEC_Logger::log( $province . ': page limit reached; some races in this province were not imported.', 'warning', true );
 			}
 			RunningSA_MEC_Logger::log( sprintf( '%s: %d events received', $province, count( $events ) ) );
 			$status['fetched'] += count( $events );
@@ -72,15 +80,20 @@ class RunningSA_MEC_Importer {
 					continue;
 				}
 				$seen[ $id ] = true;
-				$result      = self::import_event( $event );
-				if ( is_wp_error( $result ) ) {
-					$status['errors'][] = '#' . $id . ': ' . $result->get_error_message();
-					RunningSA_MEC_Logger::log( '#' . $id . ': ' . $result->get_error_message(), 'error', true );
+				$imported    = self::import_event( $event, $province );
+				if ( is_wp_error( $imported ) ) {
+					$status['errors'][] = '#' . $id . ': ' . $imported->get_error_message();
+					RunningSA_MEC_Logger::log( '#' . $id . ': ' . $imported->get_error_message(), 'error', true );
 				} else {
-					$status[ $result ]++;
+					$status[ $imported ]++;
 				}
 			}
 		}
+
+		if ( $provinces ) {
+			sleep( 1 );
+		}
+		self::apply_sync( $status );
 
 		delete_transient( 'runningsa_mec_lock' );
 		return self::finish( $status );
@@ -95,11 +108,12 @@ class RunningSA_MEC_Importer {
 		}
 		RunningSA_MEC_Logger::log(
 			sprintf(
-				'Import finished: %d fetched, %d created, %d updated, %d unchanged, %d errors',
+				'Import finished: %d fetched, %d created, %d updated, %d unchanged, %d closed, %d errors',
 				$status['fetched'],
 				$status['created'],
 				$status['updated'],
 				$status['skipped'],
+				$status['closed'],
 				count( $status['errors'] )
 			)
 		);
@@ -109,17 +123,23 @@ class RunningSA_MEC_Importer {
 	/**
 	 * Create or update one MEC event.
 	 *
-	 * @param array $event API event.
+	 * @param array  $event    API event.
+	 * @param string $province Province slug this event was fetched for. Empty for a slug import.
 	 * @return string|WP_Error created|updated|skipped.
 	 */
-	public static function import_event( array $event ) {
+	public static function import_event( array $event, $province = '' ) {
 		$args = self::map_event( $event );
 		if ( is_wp_error( $args ) ) {
 			return $args;
 		}
 
-		$hash    = md5( wp_json_encode( $event ) . '|' . (int) runningsa_mec_get_setting( 'category' ) . '|' . RUNNINGSA_MEC_VERSION );
-		$post_id = self::find_existing( (int) $event['id'] );
+		if ( '' === $province ) {
+			$province = self::province_slug_from_event( $event );
+		}
+
+		$hash       = md5( wp_json_encode( $event ) . '|' . (int) runningsa_mec_get_setting( 'category' ) . '|' . RUNNINGSA_MEC_VERSION );
+		$post_id    = self::find_existing( (int) $event['id'] );
+		$was_closed = false;
 
 		if ( $post_id ) {
 			$post = get_post( $post_id );
@@ -127,7 +147,15 @@ class RunningSA_MEC_Importer {
 			if ( ! $post || 'trash' === $post->post_status ) {
 				return 'skipped';
 			}
+			$was_closed = (bool) get_post_meta( $post_id, self::META_CLOSED, true );
 			if ( get_post_meta( $post_id, self::META_HASH, true ) === $hash ) {
+				self::remember_identity( $post_id, $event, $province );
+				// Same data, but it is listed again, so take our closed flag off.
+				if ( $was_closed ) {
+					self::mark_open( $post_id );
+					RunningSA_MEC_Logger::log( sprintf( 'Reopened #%d "%s" (post %d)', $event['id'], $event['name'], $post_id ) );
+					return 'updated';
+				}
 				return 'skipped';
 			}
 			// Keep whatever status the admin chose (e.g. draft).
@@ -154,6 +182,10 @@ class RunningSA_MEC_Importer {
 		update_post_meta( $new_id, self::META_ID, (int) $event['id'] );
 		update_post_meta( $new_id, self::META_URL, $event['url'] );
 		update_post_meta( $new_id, self::META_HASH, $hash );
+		self::remember_identity( $new_id, $event, $province );
+		if ( $was_closed ) {
+			self::mark_open( $new_id );
+		}
 
 		RunningSA_MEC_Logger::log( sprintf( '%s #%d "%s" as post %d', $post_id ? 'Updated' : 'Created', $event['id'], $event['name'], $new_id ) );
 		return $post_id ? 'updated' : 'created';
@@ -175,6 +207,142 @@ class RunningSA_MEC_Importer {
 			)
 		);
 		return $ids ? (int) $ids[0] : 0;
+	}
+
+	/**
+	 * Apply Running Calendar's sync feed.
+	 *
+	 * sync_status "removed" means the race is no longer public (cancelled, draft
+	 * or hidden). Those MEC events are marked cancelled. A race that has simply
+	 * taken place is left as a past event.
+	 *
+	 * The first run looks back one year so races already removed are closed too.
+	 *
+	 * @param array $status Status summary, updated in place.
+	 */
+	private static function apply_sync( array &$status ) {
+		$checkpoint = (string) get_option( 'runningsa_mec_synced_at', '' );
+		if ( '' === $checkpoint ) {
+			$checkpoint = gmdate( 'Y-m-d\TH:i:s\Z', time() - YEAR_IN_SECONDS );
+		}
+
+		$sync = RunningSA_MEC_API::get_updated_since( $checkpoint );
+		if ( is_wp_error( $sync ) ) {
+			$status['errors'][] = $sync->get_error_message();
+			RunningSA_MEC_Logger::log( 'Sync: ' . $sync->get_error_message(), 'error', true );
+			return;
+		}
+		if ( empty( $sync['complete'] ) ) {
+			RunningSA_MEC_Logger::log( 'Sync page limit reached. Removed races from this response were closed, and the same window will be requested next time.', 'warning', true );
+		}
+
+		$selected = array_values( array_intersect( (array) runningsa_mec_get_setting( 'provinces' ), array_keys( runningsa_mec_provinces() ) ) );
+		foreach ( $sync['events'] as $event ) {
+			$id = isset( $event['id'] ) ? (int) $event['id'] : 0;
+			if ( ! $id ) {
+				continue;
+			}
+			$state   = isset( $event['sync_status'] ) ? (string) $event['sync_status'] : '';
+			$post_id = self::find_existing( $id );
+
+			if ( 'removed' === $state ) {
+				if ( ! $post_id || 'trash' === get_post_status( $post_id ) || ! self::mark_closed( $post_id ) ) {
+					continue;
+				}
+				$status['closed']++;
+				RunningSA_MEC_Logger::log( sprintf( 'Closed post %d (Running Calendar id %d): no longer available.', $post_id, $id ) );
+				continue;
+			}
+
+			// Province imports already saved selected races. Re-import the rest we
+			// already track (a slug import, or a race we had marked closed).
+			if ( 'active' !== $state || ! $post_id || 'trash' === get_post_status( $post_id ) ) {
+				continue;
+			}
+			$province   = (string) get_post_meta( $post_id, self::META_PROVINCE, true );
+			$was_closed = (bool) get_post_meta( $post_id, self::META_CLOSED, true );
+			if ( ! $was_closed && in_array( $province, $selected, true ) ) {
+				continue;
+			}
+			$imported = self::import_event( $event );
+			if ( is_wp_error( $imported ) ) {
+				$status['errors'][] = '#' . $id . ': ' . $imported->get_error_message();
+				RunningSA_MEC_Logger::log( '#' . $id . ': ' . $imported->get_error_message(), 'error', true );
+			} else {
+				$status[ $imported ]++;
+			}
+		}
+
+		if ( empty( $sync['complete'] ) ) {
+			return;
+		}
+		$next = ! empty( $sync['max_updated_at'] ) ? $sync['max_updated_at'] : gmdate( 'Y-m-d\TH:i:s\Z' );
+		update_option( 'runningsa_mec_synced_at', $next, false );
+	}
+
+	/**
+	 * Store the slug and province without rewriting the MEC event.
+	 *
+	 * @param int    $post_id  MEC event id.
+	 * @param array  $event    API event.
+	 * @param string $province Province slug.
+	 */
+	private static function remember_identity( $post_id, array $event, $province ) {
+		if ( '' !== $province ) {
+			update_post_meta( $post_id, self::META_PROVINCE, $province );
+		}
+		$slug = isset( $event['slug'] ) ? RunningSA_MEC_API::normalize_slug( $event['slug'] ) : '';
+		if ( '' !== $slug ) {
+			update_post_meta( $post_id, self::META_SLUG, $slug );
+		}
+	}
+
+	/**
+	 * Map a venue province label back to an API slug.
+	 *
+	 * @param array $event API event.
+	 * @return string
+	 */
+	private static function province_slug_from_event( array $event ) {
+		$label = ( isset( $event['venue']['province'] ) ) ? (string) $event['venue']['province'] : '';
+		if ( '' === $label ) {
+			return '';
+		}
+		foreach ( runningsa_mec_provinces() as $slug => $name ) {
+			if ( 0 === strcasecmp( $name, $label ) ) {
+				return $slug;
+			}
+		}
+		return '';
+	}
+
+	/**
+	 * MEC's cancelled event status. The event stays on the calendar.
+	 *
+	 * @param int $post_id MEC event id.
+	 * @return bool True when this call changed it.
+	 */
+	private static function mark_closed( $post_id ) {
+		if ( get_post_meta( $post_id, self::META_CLOSED, true ) ) {
+			return false;
+		}
+		update_post_meta( $post_id, 'mec_event_status', 'EventCancelled' );
+		update_post_meta( $post_id, 'mec_cancelled_reason', __( 'This race is no longer available on Running Calendar.', 'running-sa-mec' ) );
+		update_post_meta( $post_id, 'mec_display_cancellation_reason_in_single_page', 1 );
+		update_post_meta( $post_id, self::META_CLOSED, 1 );
+		return true;
+	}
+
+	/**
+	 * Clear a cancellation this plugin applied, once the race is listed again.
+	 *
+	 * @param int $post_id MEC event id.
+	 */
+	private static function mark_open( $post_id ) {
+		update_post_meta( $post_id, 'mec_event_status', 'EventScheduled' );
+		update_post_meta( $post_id, 'mec_cancelled_reason', '' );
+		update_post_meta( $post_id, 'mec_display_cancellation_reason_in_single_page', 0 );
+		delete_post_meta( $post_id, self::META_CLOSED );
 	}
 
 	/**

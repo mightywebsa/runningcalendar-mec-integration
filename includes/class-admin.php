@@ -16,6 +16,7 @@ class RunningSA_MEC_Admin {
 		add_action( 'admin_init', array( $this, 'register_settings' ) );
 		add_action( 'admin_notices', array( $this, 'mec_notice' ) );
 		add_action( 'admin_post_runningsa_mec_force_fetch', array( $this, 'force_fetch' ) );
+		add_action( 'admin_post_runningsa_mec_import_slug', array( $this, 'import_slug' ) );
 		add_action( 'admin_post_runningsa_mec_clear_log', array( $this, 'clear_log' ) );
 		add_filter( 'plugin_action_links_' . plugin_basename( RUNNINGSA_MEC_FILE ), array( $this, 'action_links' ) );
 	}
@@ -69,6 +70,9 @@ class RunningSA_MEC_Admin {
 
 		$out['category'] = isset( $input['category'] ) ? absint( $input['category'] ) : 0;
 		$out['debug']    = empty( $input['debug'] ) ? 0 : 1;
+
+		$interval        = isset( $input['interval'] ) ? sanitize_key( $input['interval'] ) : 'daily';
+		$out['interval'] = array_key_exists( $interval, runningsa_mec_intervals() ) ? $interval : 'daily';
 		return $out;
 	}
 
@@ -83,6 +87,41 @@ class RunningSA_MEC_Admin {
 		RunningSA_MEC_API::clear_cache();
 		RunningSA_MEC_Importer::run( 'manual' );
 		wp_safe_redirect( admin_url( 'options-general.php?page=' . self::SLUG . '&runningsa_done=1' ) );
+		exit;
+	}
+
+	public function import_slug() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'You are not allowed to do this.', 'running-sa-mec' ) );
+		}
+		check_admin_referer( 'runningsa_mec_import_slug' );
+
+		$slug     = RunningSA_MEC_API::normalize_slug( isset( $_POST['slug'] ) ? wp_unslash( $_POST['slug'] ) : '' ); // phpcs:ignore
+		$redirect = admin_url( 'options-general.php?page=' . self::SLUG );
+		if ( '' === $slug ) {
+			wp_safe_redirect( add_query_arg( 'runningsa_import', 'invalid', $redirect ) );
+			exit;
+		}
+		if ( ! runningsa_mec_is_mec_active() ) {
+			wp_safe_redirect( add_query_arg( array( 'runningsa_import' => 'nomec', 'slug' => $slug ), $redirect ) );
+			exit;
+		}
+
+		$event = RunningSA_MEC_API::get_event( $slug );
+		if ( is_wp_error( $event ) ) {
+			set_transient( 'runningsa_mec_import_error_' . get_current_user_id(), $event->get_error_message(), MINUTE_IN_SECONDS );
+			wp_safe_redirect( add_query_arg( array( 'runningsa_import' => 'error', 'slug' => $slug ), $redirect ) );
+			exit;
+		}
+
+		$result = RunningSA_MEC_Importer::import_event( $event );
+		if ( is_wp_error( $result ) ) {
+			set_transient( 'runningsa_mec_import_error_' . get_current_user_id(), $result->get_error_message(), MINUTE_IN_SECONDS );
+			wp_safe_redirect( add_query_arg( array( 'runningsa_import' => 'error', 'slug' => $slug ), $redirect ) );
+			exit;
+		}
+
+		wp_safe_redirect( add_query_arg( array( 'runningsa_import' => $result, 'slug' => $slug ), $redirect ) );
 		exit;
 	}
 
@@ -122,6 +161,7 @@ class RunningSA_MEC_Admin {
 
 	private function render_settings() {
 		$provinces   = (array) runningsa_mec_get_setting( 'provinces' );
+		$interval    = (string) runningsa_mec_get_setting( 'interval' );
 		$category    = (int) runningsa_mec_get_setting( 'category' );
 		$debug       = (int) runningsa_mec_get_setting( 'debug' );
 		$has_const   = defined( 'RUNNINGSA_API_KEY' ) && RUNNINGSA_API_KEY;
@@ -132,6 +172,7 @@ class RunningSA_MEC_Admin {
 		if ( isset( $_GET['runningsa_done'] ) ) { // phpcs:ignore
 			echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__( 'Force fetch finished. See the status below.', 'running-sa-mec' ) . '</p></div>';
 		}
+		$this->render_import_notice();
 		?>
 		<form method="post" action="options.php">
 			<?php settings_fields( 'runningsa_mec' ); ?>
@@ -157,6 +198,17 @@ class RunningSA_MEC_Admin {
 							<label style="display:block"><input type="checkbox" name="runningsa_mec_settings[provinces][]" value="<?php echo esc_attr( $slug ); ?>" <?php checked( in_array( $slug, $provinces, true ) ); ?> /> <?php echo esc_html( $label ); ?></label>
 						<?php endforeach; ?>
 						<p class="description"><?php esc_html_e( 'One API call is made per selected province.', 'running-sa-mec' ); ?></p>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="runningsa_interval"><?php esc_html_e( 'Import frequency', 'running-sa-mec' ); ?></label></th>
+					<td>
+						<select id="runningsa_interval" name="runningsa_mec_settings[interval]">
+							<?php foreach ( runningsa_mec_intervals() as $key => $choice ) : ?>
+								<option value="<?php echo esc_attr( $key ); ?>" <?php selected( $interval, $key ); ?>><?php echo esc_html( $choice['label'] ); ?></option>
+							<?php endforeach; ?>
+						</select>
+						<p class="description"><?php esc_html_e( 'How often to fetch races. On each fetch, races Running Calendar reports as no longer available are marked cancelled in MEC. Save settings to apply a new frequency.', 'running-sa-mec' ); ?></p>
 					</td>
 				</tr>
 				<tr>
@@ -202,14 +254,15 @@ class RunningSA_MEC_Admin {
 			<p>
 				<?php
 				printf(
-					/* translators: 1: time, 2: trigger, 3: fetched, 4: created, 5: updated, 6: unchanged, 7: errors */
-					esc_html__( 'Last run: %1$s (%2$s) — %3$d fetched, %4$d created, %5$d updated, %6$d unchanged, %7$d errors.', 'running-sa-mec' ),
+					/* translators: 1: time, 2: trigger, 3: fetched, 4: created, 5: updated, 6: unchanged, 7: closed, 8: errors */
+					esc_html__( 'Last run: %1$s (%2$s) — %3$d fetched, %4$d created, %5$d updated, %6$d unchanged, %7$d closed, %8$d errors.', 'running-sa-mec' ),
 					esc_html( $last['time'] ),
 					esc_html( $last['trigger'] ),
 					(int) $last['fetched'],
 					(int) $last['created'],
 					(int) $last['updated'],
 					(int) $last['skipped'],
+					isset( $last['closed'] ) ? (int) $last['closed'] : 0,
 					count( (array) $last['errors'] )
 				);
 				?>
@@ -231,7 +284,45 @@ class RunningSA_MEC_Admin {
 			<?php submit_button( __( 'Force fetch now', 'running-sa-mec' ), 'secondary', 'submit', false ); ?>
 			<span class="description"><?php esc_html_e( 'Clears the 10-minute cache and imports straight away. Save settings first.', 'running-sa-mec' ); ?></span>
 		</form>
+
+		<hr />
+		<h2><?php esc_html_e( 'Import one race', 'running-sa-mec' ); ?></h2>
+		<p class="description"><?php esc_html_e( 'Paste a Running Calendar event slug, such as cape-town-marathon, or the event page URL. The race is loaded from the API and added to MEC.', 'running-sa-mec' ); ?></p>
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+			<input type="hidden" name="action" value="runningsa_mec_import_slug" />
+			<?php wp_nonce_field( 'runningsa_mec_import_slug' ); ?>
+			<input type="text" name="slug" class="regular-text" value="<?php echo isset( $_GET['slug'] ) ? esc_attr( sanitize_text_field( wp_unslash( $_GET['slug'] ) ) ) : ''; // phpcs:ignore ?>" placeholder="cape-town-marathon" />
+			<?php submit_button( __( 'Import race', 'running-sa-mec' ), 'secondary', 'submit', false ); ?>
+		</form>
 		<?php
+	}
+
+	/**
+	 * Result of the single-race import form.
+	 */
+	private function render_import_notice() {
+		$result = isset( $_GET['runningsa_import'] ) ? sanitize_key( wp_unslash( $_GET['runningsa_import'] ) ) : ''; // phpcs:ignore
+		if ( '' === $result ) {
+			return;
+		}
+		$messages = array(
+			'created' => __( 'Race imported.', 'running-sa-mec' ),
+			'updated' => __( 'That race was already on the calendar and has been updated.', 'running-sa-mec' ),
+			'skipped' => __( 'That race is already on the calendar and has not changed.', 'running-sa-mec' ),
+			'invalid' => __( 'Enter a race slug, or a runningcalendar.co.za event URL.', 'running-sa-mec' ),
+			'nomec'   => __( 'Modern Events Calendar needs to be active before a race can be imported.', 'running-sa-mec' ),
+		);
+		if ( 'error' === $result ) {
+			$detail = get_transient( 'runningsa_mec_import_error_' . get_current_user_id() );
+			delete_transient( 'runningsa_mec_import_error_' . get_current_user_id() );
+			$text = $detail ? $detail : __( 'The race could not be imported.', 'running-sa-mec' );
+			echo '<div class="notice notice-error is-dismissible"><p>' . esc_html( $text ) . '</p></div>';
+			return;
+		}
+		if ( isset( $messages[ $result ] ) ) {
+			$class = ( 'invalid' === $result || 'nomec' === $result ) ? 'notice-error' : 'notice-success';
+			echo '<div class="notice ' . esc_attr( $class ) . ' is-dismissible"><p>' . esc_html( $messages[ $result ] ) . '</p></div>';
+		}
 	}
 
 	private function render_logs() {

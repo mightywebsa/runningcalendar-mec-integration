@@ -2,7 +2,9 @@
 
 Integrate the South African Running Calendar with Modern Events Calendar on WordPress.
 
-This plugin imports upcoming races from the [RunningCalendar API](https://api.runningcalendar.co.za/docs) into Modern Events Calendar once a day. Each listing links back to its event page on RunningCalendar, using the `url` field exactly as the API returns it.
+This plugin imports upcoming races from the [RunningCalendar API](https://api.runningcalendar.co.za/docs) into Modern Events Calendar. Choose how often that runs: every 6 hours, every 12 hours, once a day, or once a week. Each listing links back to its event page on RunningCalendar, using the `url` field exactly as the API returns it.
+
+On each fetch, a race that Running Calendar reports as no longer available is marked cancelled in MEC. A race that has simply taken place stays on the calendar as a past event. You can also import one race by its slug from the settings page.
 
 ## API key and credentials
 
