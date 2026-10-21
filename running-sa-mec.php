@@ -1,6 +1,6 @@
 <?php
 /**
- * Plugin Name:       RunningSA integration with MEC
+ * Plugin Name:       Running Calendar integration with MEC
  * Description:       Imports upcoming races from the RunningCalendar API into Modern Events Calendar (MEC) events, once a day.
  * Version:           1.0.0
  * Author:            MightyWeb

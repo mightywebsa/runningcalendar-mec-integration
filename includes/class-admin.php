@@ -1,6 +1,6 @@
 <?php
 /**
- * Settings page (Settings > RunningSA MEC) with Settings and Logs tabs.
+ * Settings page (Settings > Running Calendar MEC) with Settings and Logs tabs.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -22,8 +22,8 @@ class RunningSA_MEC_Admin {
 
 	public function menu() {
 		add_options_page(
-			__( 'RunningSA integration with MEC', 'running-sa-mec' ),
-			__( 'RunningSA MEC', 'running-sa-mec' ),
+			__( 'Running Calendar integration with MEC', 'running-sa-mec' ),
+			__( 'Running Calendar MEC', 'running-sa-mec' ),
 			'manage_options',
 			self::SLUG,
 			array( $this, 'render' )
@@ -39,7 +39,7 @@ class RunningSA_MEC_Admin {
 		if ( runningsa_mec_is_mec_active() || ! current_user_can( 'activate_plugins' ) ) {
 			return;
 		}
-		echo '<div class="notice notice-error"><p>' . esc_html__( 'RunningSA integration with MEC needs the Modern Events Calendar plugin. Please install and activate it; no races will be imported until then.', 'running-sa-mec' ) . '</p></div>';
+		echo '<div class="notice notice-error"><p>' . esc_html__( 'Running Calendar integration with MEC needs the Modern Events Calendar plugin. Please install and activate it; no races will be imported until then.', 'running-sa-mec' ) . '</p></div>';
 	}
 
 	public function register_settings() {
@@ -104,7 +104,7 @@ class RunningSA_MEC_Admin {
 		$base = admin_url( 'options-general.php?page=' . self::SLUG );
 		?>
 		<div class="wrap">
-			<h1><?php esc_html_e( 'RunningSA integration with MEC', 'running-sa-mec' ); ?></h1>
+			<h1><?php esc_html_e( 'Running Calendar integration with MEC', 'running-sa-mec' ); ?></h1>
 			<nav class="nav-tab-wrapper">
 				<a href="<?php echo esc_url( $base ); ?>" class="nav-tab <?php echo 'settings' === $tab ? 'nav-tab-active' : ''; ?>"><?php esc_html_e( 'Settings', 'running-sa-mec' ); ?></a>
 				<a href="<?php echo esc_url( $base . '&tab=logs' ); ?>" class="nav-tab <?php echo 'logs' === $tab ? 'nav-tab-active' : ''; ?>"><?php esc_html_e( 'Logs', 'running-sa-mec' ); ?></a>
