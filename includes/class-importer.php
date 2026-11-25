@@ -13,20 +13,28 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class RunningSA_MEC_Importer {
 
-	const META_ID       = '_runningsa_id';       // RunningCalendar event id (dedupe key).
-	const META_URL      = '_runningsa_url';      // Their canonical url, unchanged.
-	const META_HASH     = '_runningsa_hash';     // Hash of the API data, to skip unchanged events.
-	const META_PROVINCE = '_runningsa_province'; // Province slug this event was imported from.
-	const META_SLUG     = '_runningsa_slug';     // RunningCalendar slug.
-	const META_CLOSED   = '_runningsa_closed';   // We marked this MEC event cancelled.
+	const META_ID        = '_runningsa_id';        // RunningCalendar event id (dedupe key).
+	const META_URL       = '_runningsa_url';       // Website url exactly as returned, tracking included.
+	const META_CANONICAL = '_runningsa_canonical_url'; // Clean url for matching only. Never used as a link.
+	const META_IMAGE     = '_runningsa_image_url'; // Event logo URL. Loaded remotely, never copied.
+	const META_RACE_IDS  = '_runningsa_race_ids';  // Race-level ids from the API, for one-to-one mapping.
+	const META_HASH      = '_runningsa_hash';      // Hash of the API data, to skip unchanged events.
+	const META_PROVINCE  = '_runningsa_province';  // Province slug this event was imported from.
+	const META_SLUG      = '_runningsa_slug';      // RunningCalendar slug.
+	const META_CLOSED    = '_runningsa_closed';    // We marked this MEC event cancelled.
+
+	/** When true, rewrite events even if the API payload hash is unchanged. */
+	private static $force = false;
 
 	/**
 	 * Run one import of all selected provinces.
 	 *
-	 * @param string $trigger cron|manual.
+	 * @param string $trigger cron|manual|resync.
+	 * @param bool   $force   Rewrite every event, including ones whose payload has not changed.
 	 * @return array Status summary.
 	 */
-	public static function run( $trigger = 'cron' ) {
+	public static function run( $trigger = 'cron', $force = false ) {
+		self::$force = (bool) $force;
 		$status = array(
 			'time'     => current_time( 'mysql' ),
 			'trigger'  => $trigger,
@@ -138,7 +146,8 @@ class RunningSA_MEC_Importer {
 		}
 
 		$hash       = md5( wp_json_encode( $event ) . '|' . (int) runningsa_mec_get_setting( 'category' ) . '|' . RUNNINGSA_MEC_VERSION );
-		$post_id    = self::find_existing( (int) $event['id'] );
+		$canonical  = isset( $event['canonical_url'] ) ? (string) $event['canonical_url'] : '';
+		$post_id    = self::find_existing( (int) $event['id'], $canonical );
 		$was_closed = false;
 
 		if ( $post_id ) {
@@ -148,7 +157,7 @@ class RunningSA_MEC_Importer {
 				return 'skipped';
 			}
 			$was_closed = (bool) get_post_meta( $post_id, self::META_CLOSED, true );
-			if ( get_post_meta( $post_id, self::META_HASH, true ) === $hash ) {
+			if ( ! self::$force && get_post_meta( $post_id, self::META_HASH, true ) === $hash ) {
 				self::remember_identity( $post_id, $event, $province );
 				// Same data, but it is listed again, so take our closed flag off.
 				if ( $was_closed ) {
@@ -174,6 +183,11 @@ class RunningSA_MEC_Importer {
 		if ( $args['location_id'] > 1 ) {
 			wp_set_object_terms( $new_id, (int) $args['location_id'], 'mec_location' );
 		}
+		if ( ! empty( $args['organizer_id'] ) && $args['organizer_id'] > 1 ) {
+			wp_set_object_terms( $new_id, (int) $args['organizer_id'], 'mec_organizer' );
+		} elseif ( taxonomy_exists( 'mec_organizer' ) ) {
+			wp_set_object_terms( $new_id, array(), 'mec_organizer' );
+		}
 		$category = (int) runningsa_mec_get_setting( 'category' );
 		if ( $category ) {
 			wp_set_object_terms( $new_id, $category, 'mec_category', true );
@@ -192,21 +206,61 @@ class RunningSA_MEC_Importer {
 	}
 
 	/**
-	 * Find the MEC event we made earlier for this RunningCalendar id.
+	 * Find the MEC event for this RunningCalendar edition.
+	 * Match on id, then canonical_url. The tracked url is not a match key.
+	 *
+	 * @param int    $rc_id     RunningCalendar event id.
+	 * @param string $canonical Clean url, if the payload has one.
+	 * @return int
 	 */
-	private static function find_existing( $rc_id ) {
+	private static function find_existing( $rc_id, $canonical = '' ) {
+		$by_id = self::find_by_meta( self::META_ID, (string) (int) $rc_id );
+		if ( $by_id ) {
+			return $by_id;
+		}
+		$canonical = self::https_url( $canonical );
+		if ( '' === $canonical ) {
+			return 0;
+		}
+		return self::find_by_meta( self::META_CANONICAL, $canonical );
+	}
+
+	/**
+	 * @param string $key   Meta key.
+	 * @param string $value Meta value.
+	 * @return int
+	 */
+	private static function find_by_meta( $key, $value ) {
+		if ( '' === $value || '0' === $value ) {
+			return 0;
+		}
 		$ids = get_posts(
 			array(
 				'post_type'      => 'mec-events',
 				'post_status'    => array( 'publish', 'future', 'draft', 'pending', 'private', 'trash' ),
-				'meta_key'       => self::META_ID, // phpcs:ignore
-				'meta_value'     => $rc_id,        // phpcs:ignore
+				'meta_key'       => $key,   // phpcs:ignore
+				'meta_value'     => $value, // phpcs:ignore
 				'fields'         => 'ids',
 				'posts_per_page' => 1,
 				'no_found_rows'  => true,
 			)
 		);
 		return $ids ? (int) $ids[0] : 0;
+	}
+
+	/**
+	 * An https URL exactly as received, or empty when it is not one.
+	 * Query parameters are kept. app_url is never passed in here.
+	 *
+	 * @param mixed $url Raw value.
+	 * @return string
+	 */
+	private static function https_url( $url ) {
+		$url = trim( (string) $url );
+		if ( 0 !== strpos( $url, 'https://' ) || ! filter_var( $url, FILTER_VALIDATE_URL ) ) {
+			return '';
+		}
+		return $url;
 	}
 
 	/**
@@ -236,7 +290,6 @@ class RunningSA_MEC_Importer {
 			RunningSA_MEC_Logger::log( 'Sync page limit reached. Removed races from this response were closed, and the same window will be requested next time.', 'warning', true );
 		}
 
-		$selected = array_values( array_intersect( (array) runningsa_mec_get_setting( 'provinces' ), array_keys( runningsa_mec_provinces() ) ) );
 		foreach ( $sync['events'] as $event ) {
 			$id = isset( $event['id'] ) ? (int) $event['id'] : 0;
 			if ( ! $id ) {
@@ -254,14 +307,10 @@ class RunningSA_MEC_Importer {
 				continue;
 			}
 
-			// Province imports already saved selected races. Re-import the rest we
-			// already track (a slug import, or a race we had marked closed).
+			// Active items carry the full payload. Import them even for selected
+			// provinces so updated_since changes to times, fees and venues are
+			// applied. import_event hash-skips events that have not changed.
 			if ( 'active' !== $state || ! $post_id || 'trash' === get_post_status( $post_id ) ) {
-				continue;
-			}
-			$province   = (string) get_post_meta( $post_id, self::META_PROVINCE, true );
-			$was_closed = (bool) get_post_meta( $post_id, self::META_CLOSED, true );
-			if ( ! $was_closed && in_array( $province, $selected, true ) ) {
 				continue;
 			}
 			$imported = self::import_event( $event );
@@ -295,6 +344,33 @@ class RunningSA_MEC_Importer {
 		if ( '' !== $slug ) {
 			update_post_meta( $post_id, self::META_SLUG, $slug );
 		}
+		$canonical = self::https_url( isset( $event['canonical_url'] ) ? $event['canonical_url'] : '' );
+		if ( '' !== $canonical ) {
+			update_post_meta( $post_id, self::META_CANONICAL, $canonical );
+		}
+		$image = self::https_url( isset( $event['image_url'] ) ? $event['image_url'] : '' );
+		if ( '' !== $image ) {
+			update_post_meta( $post_id, self::META_IMAGE, $image );
+		} else {
+			delete_post_meta( $post_id, self::META_IMAGE );
+		}
+		update_post_meta( $post_id, self::META_RACE_IDS, self::race_ids( isset( $event['races'] ) && is_array( $event['races'] ) ? $event['races'] : array() ) );
+	}
+
+	/**
+	 * Stable race ids from an API event, in payload order.
+	 *
+	 * @param array $races Race arrays.
+	 * @return int[]
+	 */
+	private static function race_ids( array $races ) {
+		$ids = array();
+		foreach ( $races as $race ) {
+			if ( isset( $race['id'] ) && (int) $race['id'] ) {
+				$ids[] = (int) $race['id'];
+			}
+		}
+		return $ids;
 	}
 
 	/**
@@ -390,7 +466,7 @@ class RunningSA_MEC_Importer {
 			'title'              => wp_slash( sanitize_text_field( $event['name'] ) ),
 			'content'            => wp_slash( self::build_content( $event, $races ) ),
 			'status'             => 'publish',
-			'organizer_id'       => 1, // MEC's "no organizer" (not in the API yet).
+			'organizer_id'       => self::get_organizer_id( $event ),
 			'date'               => array(
 				'repeat'        => array(),
 				'allday'        => $allday,
@@ -420,7 +496,7 @@ class RunningSA_MEC_Importer {
 			'not_in_days'        => '',
 			'meta'               => array(
 				'mec_source'           => 'runningcalendar',
-				'mec_more_info'        => $event['url'], // Exactly as received.
+				'mec_more_info'        => $event['url'], // Tracked website url, exactly as received. Not canonical_url.
 				'mec_more_info_title'  => __( 'View on RunningCalendar', 'running-sa-mec' ),
 				'mec_more_info_target' => '_blank',
 				'mec_cost'             => $cost,
@@ -476,7 +552,16 @@ class RunningSA_MEC_Importer {
 	 * Event description: race list, venue, and the required link back.
 	 */
 	public static function build_content( array $event, array $races ) {
-		$html = '';
+		$html  = '';
+		$image = self::https_url( isset( $event['image_url'] ) ? $event['image_url'] : '' );
+		if ( '' !== $image ) {
+			// Remote logo. Do not download it; Running Calendar updates the file in place.
+			$html .= '<p class="runningsa-logo"><img src="' . esc_url( $image ) . '" alt="' . esc_attr( $event['name'] ) . '" /></p>';
+		}
+		if ( isset( $event['summary'] ) && is_string( $event['summary'] ) && '' !== trim( $event['summary'] ) ) {
+			$html .= '<p class="runningsa-summary">' . esc_html( $event['summary'] ) . '</p>';
+		}
+		$html .= self::organiser_html( $event );
 		if ( $races ) {
 			$html .= '<h3>' . esc_html__( 'Races', 'running-sa-mec' ) . '</h3><ul class="runningsa-races">';
 			foreach ( $races as $race ) {
@@ -490,8 +575,10 @@ class RunningSA_MEC_Importer {
 						? __( 'free entry', 'running-sa-mec' )
 						: self::money( (float) $race['race_fee_from'], isset( $race['race_fee_currency'] ) ? $race['race_fee_currency'] : '' );
 				}
-				$name  = ! empty( $race['name'] ) ? $race['name'] : ( isset( $race['distance_label'] ) ? $race['distance_label'] : '' );
-				$html .= '<li><strong>' . esc_html( $name ) . '</strong>' . ( $parts ? ' &ndash; ' . esc_html( implode( ', ', $parts ) ) : '' ) . '</li>';
+				$name    = ! empty( $race['name'] ) ? $race['name'] : ( isset( $race['distance_label'] ) ? $race['distance_label'] : '' );
+				$race_id = ( isset( $race['id'] ) && (int) $race['id'] ) ? (int) $race['id'] : 0;
+				$attr    = $race_id ? ' data-race-id="' . esc_attr( (string) $race_id ) . '"' : '';
+				$html   .= '<li' . $attr . '><strong>' . esc_html( $name ) . '</strong>' . ( $parts ? ' &ndash; ' . esc_html( implode( ', ', $parts ) ) : '' ) . '</li>';
 			}
 			$html .= '</ul>';
 		}
@@ -500,11 +587,32 @@ class RunningSA_MEC_Importer {
 			$html .= '<p><em>' . esc_html__( 'Details for this race are not yet verified. Please check the race page before entering.', 'running-sa-mec' ) . '</em></p>';
 		}
 
-		// Required by RunningCalendar's terms: link back using their url, unchanged, no noreferrer.
+		// Tracked website url, exactly as returned. Not canonical_url, and no noreferrer.
 		$html .= '<p class="runningsa-source"><a href="' . esc_url( $event['url'] ) . '" target="_blank" rel="noopener">'
 			. esc_html__( 'View this race on RunningCalendar', 'running-sa-mec' ) . '</a></p>';
 
 		return $html;
+	}
+
+	/**
+	 * Organiser name, linked with their website url when they have a public page.
+	 * app_url is ignored.
+	 *
+	 * @param array $event API event.
+	 * @return string
+	 */
+	private static function organiser_html( array $event ) {
+		$org = ( isset( $event['organiser'] ) && is_array( $event['organiser'] ) ) ? $event['organiser'] : array();
+		$name = isset( $org['name'] ) ? trim( (string) $org['name'] ) : '';
+		if ( '' === $name ) {
+			return '';
+		}
+		$url  = self::https_url( isset( $org['url'] ) ? $org['url'] : '' );
+		$html = '<p class="runningsa-organiser">' . esc_html__( 'Organised by', 'running-sa-mec' ) . ' ';
+		$html .= '' !== $url
+			? '<a href="' . esc_url( $url ) . '" target="_blank" rel="noopener">' . esc_html( $name ) . '</a>'
+			: esc_html( $name );
+		return $html . '</p>';
 	}
 
 	/**
@@ -534,24 +642,76 @@ class RunningSA_MEC_Importer {
 			)
 		);
 		if ( ! is_wp_error( $found ) && $found ) {
-			return (int) $found[0];
+			$term_id = (int) $found[0];
+		} else {
+			$term = wp_insert_term( $name, 'mec_location' );
+			if ( is_wp_error( $term ) ) {
+				// Term with the same name made by hand: reuse it.
+				$term_id = (int) $term->get_error_data( 'term_exists' );
+				if ( ! $term_id ) {
+					return 1;
+				}
+			} else {
+				$term_id = (int) $term['term_id'];
+			}
+			update_term_meta( $term_id, '_runningsa_loc', $key );
 		}
 
-		$term = wp_insert_term( $name, 'mec_location' );
-		if ( is_wp_error( $term ) ) {
-			// Term with the same name made by hand: reuse it.
-			$term_id = (int) $term->get_error_data( 'term_exists' );
-			if ( ! $term_id ) {
-				return 1;
-			}
-		} else {
-			$term_id = (int) $term['term_id'];
-			$country = ( isset( $venue['country_iso2'] ) && 'ZA' === $venue['country_iso2'] ) ? 'South Africa' : ( isset( $venue['country_iso2'] ) ? $venue['country_iso2'] : '' );
-			update_term_meta( $term_id, 'address', trim( $name . ( $country ? ', ' . $country : '' ) ) );
-			update_term_meta( $term_id, 'latitude', isset( $venue['lat'] ) ? (string) (float) $venue['lat'] : '' );
-			update_term_meta( $term_id, 'longitude', isset( $venue['lng'] ) ? (string) (float) $venue['lng'] : '' );
+		$country = ( isset( $venue['country_iso2'] ) && 'ZA' === $venue['country_iso2'] ) ? 'South Africa' : ( isset( $venue['country_iso2'] ) ? $venue['country_iso2'] : '' );
+		update_term_meta( $term_id, 'address', trim( $name . ( $country ? ', ' . $country : '' ) ) );
+		update_term_meta( $term_id, 'latitude', isset( $venue['lat'] ) ? (string) (float) $venue['lat'] : '' );
+		update_term_meta( $term_id, 'longitude', isset( $venue['lng'] ) ? (string) (float) $venue['lng'] : '' );
+		return $term_id;
+	}
+
+	/**
+	 * Find or create the mec_organizer term. 1 means MEC's "no organizer".
+	 *
+	 * @param array $event API event.
+	 * @return int
+	 */
+	private static function get_organizer_id( array $event ) {
+		if ( ! taxonomy_exists( 'mec_organizer' ) ) {
+			return 1;
 		}
-		update_term_meta( $term_id, '_runningsa_loc', $key );
+		$org  = ( isset( $event['organiser'] ) && is_array( $event['organiser'] ) ) ? $event['organiser'] : array();
+		$name = isset( $org['name'] ) ? sanitize_text_field( $org['name'] ) : '';
+		if ( '' === $name ) {
+			return 1;
+		}
+		$url = self::https_url( isset( $org['url'] ) ? $org['url'] : '' );
+		$key = sanitize_title( $name );
+
+		$found = get_terms(
+			array(
+				'taxonomy'   => 'mec_organizer',
+				'hide_empty' => false,
+				'number'     => 1,
+				'fields'     => 'ids',
+				'meta_key'   => '_runningsa_org', // phpcs:ignore
+				'meta_value' => $key,             // phpcs:ignore
+			)
+		);
+		if ( ! is_wp_error( $found ) && $found ) {
+			$term_id = (int) $found[0];
+		} else {
+			$term = wp_insert_term( $name, 'mec_organizer' );
+			if ( is_wp_error( $term ) ) {
+				$term_id = (int) $term->get_error_data( 'term_exists' );
+				if ( ! $term_id ) {
+					return 1;
+				}
+			} else {
+				$term_id = (int) $term['term_id'];
+			}
+			update_term_meta( $term_id, '_runningsa_org', $key );
+		}
+
+		if ( '' !== $url ) {
+			update_term_meta( $term_id, 'url', $url );
+		} else {
+			delete_term_meta( $term_id, 'url' );
+		}
 		return $term_id;
 	}
 }

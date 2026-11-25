@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       Running Calendar integration with MEC
  * Description:       Imports upcoming races from the RunningCalendar API into Modern Events Calendar (MEC) events on a schedule you choose.
- * Version:           1.0.2
+ * Version:           1.1.1
  * Author:            MightyWeb
  * Requires PHP:      7.4
  * Requires at least: 5.8
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'RUNNINGSA_MEC_VERSION', '1.0.2' );
+define( 'RUNNINGSA_MEC_VERSION', '1.1.1' );
 define( 'RUNNINGSA_MEC_FILE', __FILE__ );
 define( 'RUNNINGSA_MEC_DIR', plugin_dir_path( __FILE__ ) );
 define( 'RUNNINGSA_MEC_CRON_HOOK', 'runningsa_mec_daily_fetch' );
@@ -25,6 +25,7 @@ require_once RUNNINGSA_MEC_DIR . 'includes/class-logger.php';
 require_once RUNNINGSA_MEC_DIR . 'includes/class-api.php';
 require_once RUNNINGSA_MEC_DIR . 'includes/class-importer.php';
 require_once RUNNINGSA_MEC_DIR . 'includes/class-admin.php';
+require_once RUNNINGSA_MEC_DIR . 'includes/class-export-lock.php';
 
 /**
  * Import frequencies. Keys are stored in settings; schedule is the WP-Cron name.
@@ -47,11 +48,6 @@ function runningsa_mec_intervals() {
 			'schedule' => 'daily',
 			'seconds'  => DAY_IN_SECONDS,
 			'label'    => __( 'Once a day', 'running-sa-mec' ),
-		),
-		'weekly'       => array(
-			'schedule' => 'weekly',
-			'seconds'  => WEEK_IN_SECONDS,
-			'label'    => __( 'Once a week', 'running-sa-mec' ),
 		),
 	);
 }
@@ -141,11 +137,13 @@ function runningsa_mec_is_mec_active() {
  */
 function runningsa_mec_get_setting( $key ) {
 	$defaults = array(
-		'api_key'   => '',
-		'provinces' => array( 'free-state', 'northern-cape' ),
-		'interval'  => 'daily',
-		'category'  => 0,
-		'debug'     => 0,
+		'api_key'     => '',
+		'provinces'   => array( 'free-state', 'northern-cape' ),
+		'interval'    => 'daily',
+		'category'    => 0,
+		'debug'       => 0,
+		'show_credit'     => 1,
+		'restrict_export' => 1,
 	);
 	$settings = wp_parse_args( (array) get_option( 'runningsa_mec_settings', array() ), $defaults );
 	return isset( $settings[ $key ] ) ? $settings[ $key ] : null;
@@ -192,6 +190,135 @@ function runningsa_mec_run_cron() {
 	RunningSA_MEC_Importer::run( 'cron' );
 }
 add_action( RUNNINGSA_MEC_CRON_HOOK, 'runningsa_mec_run_cron' );
+
+/**
+ * Show the Running Calendar logo from its URL. The file is not copied into the media library.
+ *
+ * @param string $html    Existing thumbnail HTML.
+ * @param int    $post_id Post id.
+ * @return string
+ */
+function runningsa_mec_remote_thumbnail( $html, $post_id ) {
+	if ( $html || 'mec-events' !== get_post_type( $post_id ) ) {
+		return $html;
+	}
+	$url = get_post_meta( $post_id, RunningSA_MEC_Importer::META_IMAGE, true );
+	if ( ! is_string( $url ) || 0 !== strpos( $url, 'https://' ) ) {
+		return $html;
+	}
+	return '<img src="' . esc_url( $url ) . '" alt="' . esc_attr( get_the_title( $post_id ) ) . '" class="wp-post-image" />';
+}
+add_filter( 'post_thumbnail_html', 'runningsa_mec_remote_thumbnail', 10, 2 );
+
+/**
+ * Credit block: bundled RunningCalendar logo + text, linked with the tracked url.
+ * Rendered at display time so existing events get it without a database rewrite.
+ *
+ * @param int $post_id MEC event id.
+ * @return string
+ */
+function runningsa_mec_credit_block( $post_id = 0 ) {
+	static $printed = array();
+
+	if ( ! runningsa_mec_get_setting( 'show_credit' ) ) {
+		return '';
+	}
+	$post_id = $post_id ? (int) $post_id : (int) get_the_ID();
+	if ( ! $post_id || 'mec-events' !== get_post_type( $post_id ) ) {
+		return '';
+	}
+	if ( isset( $printed[ $post_id ] ) ) {
+		return '';
+	}
+	$url = get_post_meta( $post_id, RunningSA_MEC_Importer::META_URL, true );
+	if ( ! is_string( $url ) || 0 !== strpos( $url, 'https://' ) || ! filter_var( $url, FILTER_VALIDATE_URL ) ) {
+		return '';
+	}
+
+	$printed[ $post_id ] = true;
+	$src = plugins_url( 'assets/runningcalendar-logo.svg', RUNNINGSA_MEC_FILE );
+	return '<div class="runningsa-credit"><a class="runningsa-credit-link" href="' . esc_url( $url ) . '" target="_blank" rel="noopener">'
+		. '<img class="runningsa-credit-logo" src="' . esc_url( $src ) . '" alt="' . esc_attr__( 'RunningCalendar', 'running-sa-mec' ) . '" width="48" height="48" />'
+		. '<span class="runningsa-credit-text">' . esc_html__( 'Race data from RunningCalendar', 'running-sa-mec' ) . '</span>'
+		. '</a></div>';
+}
+
+/**
+ * Append the credit block to the event content when MEC uses the_content.
+ *
+ * @param string $content Post content.
+ * @return string
+ */
+function runningsa_mec_append_credit( $content ) {
+	if ( is_admin() || ! is_singular( 'mec-events' ) ) {
+		return $content;
+	}
+	if ( false !== strpos( $content, 'runningsa-credit' ) ) {
+		return $content;
+	}
+	return $content . runningsa_mec_credit_block();
+}
+add_filter( 'the_content', 'runningsa_mec_append_credit', 20 );
+
+/**
+ * MEC single-event templates often skip the_content. Hook their after-content action.
+ *
+ * @param mixed $event MEC event object or id, when the hook provides one.
+ */
+function runningsa_mec_echo_credit( $event = null ) {
+	$post_id = 0;
+	if ( is_object( $event ) ) {
+		if ( isset( $event->ID ) ) {
+			$post_id = (int) $event->ID;
+		} elseif ( isset( $event->data ) && is_object( $event->data ) && isset( $event->data->ID ) ) {
+			$post_id = (int) $event->data->ID;
+		}
+	} elseif ( is_numeric( $event ) ) {
+		$post_id = (int) $event;
+	}
+	echo runningsa_mec_credit_block( $post_id ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- already escaped.
+}
+add_action( 'mec_single_after_content', 'runningsa_mec_echo_credit', 20 );
+add_action( 'mec_single_event_after_content', 'runningsa_mec_echo_credit', 20 );
+add_action( 'mec_skin_single_after_content', 'runningsa_mec_echo_credit', 20 );
+
+/**
+ * Small stylesheet for the credit block.
+ */
+function runningsa_mec_enqueue_credit_css() {
+	if ( ! runningsa_mec_get_setting( 'show_credit' ) ) {
+		return;
+	}
+	wp_enqueue_style(
+		'runningsa-mec-credit',
+		plugins_url( 'assets/credit.css', RUNNINGSA_MEC_FILE ),
+		array(),
+		RUNNINGSA_MEC_VERSION
+	);
+}
+add_action( 'wp_enqueue_scripts', 'runningsa_mec_enqueue_credit_css' );
+
+
+/**
+ * Saved “weekly” frequencies are no longer offered. Move them to daily and
+ * reschedule the cron job to start in five minutes.
+ */
+function runningsa_mec_migrate_weekly_interval() {
+	$settings = get_option( 'runningsa_mec_settings', array() );
+	if ( ! is_array( $settings ) || ! isset( $settings['interval'] ) || 'weekly' !== $settings['interval'] ) {
+		return;
+	}
+
+	$settings['interval'] = 'daily';
+	remove_action( 'update_option_runningsa_mec_settings', 'runningsa_mec_ensure_schedule' );
+	update_option( 'runningsa_mec_settings', $settings );
+	add_action( 'update_option_runningsa_mec_settings', 'runningsa_mec_ensure_schedule' );
+
+	wp_clear_scheduled_hook( RUNNINGSA_MEC_CRON_HOOK );
+	wp_schedule_event( time() + 300, 'daily', RUNNINGSA_MEC_CRON_HOOK );
+}
+
+add_action( 'init', 'runningsa_mec_migrate_weekly_interval', 9 );
 add_action( 'init', 'runningsa_mec_ensure_schedule' );
 add_action( 'update_option_runningsa_mec_settings', 'runningsa_mec_ensure_schedule' );
 add_action( 'add_option_runningsa_mec_settings', 'runningsa_mec_ensure_schedule' );
