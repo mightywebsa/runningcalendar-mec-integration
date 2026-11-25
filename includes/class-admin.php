@@ -16,6 +16,7 @@ class RunningSA_MEC_Admin {
 		add_action( 'admin_init', array( $this, 'register_settings' ) );
 		add_action( 'admin_notices', array( $this, 'mec_notice' ) );
 		add_action( 'admin_post_runningsa_mec_force_fetch', array( $this, 'force_fetch' ) );
+		add_action( 'admin_post_runningsa_mec_resync', array( $this, 'resync' ) );
 		add_action( 'admin_post_runningsa_mec_import_slug', array( $this, 'import_slug' ) );
 		add_action( 'admin_post_runningsa_mec_clear_log', array( $this, 'clear_log' ) );
 		add_filter( 'plugin_action_links_' . plugin_basename( RUNNINGSA_MEC_FILE ), array( $this, 'action_links' ) );
@@ -68,8 +69,9 @@ class RunningSA_MEC_Admin {
 		$provinces        = isset( $input['provinces'] ) ? array_map( 'sanitize_key', (array) $input['provinces'] ) : array();
 		$out['provinces'] = array_values( array_intersect( $provinces, $valid ) );
 
-		$out['category'] = isset( $input['category'] ) ? absint( $input['category'] ) : 0;
-		$out['debug']    = empty( $input['debug'] ) ? 0 : 1;
+		$out['category']    = isset( $input['category'] ) ? absint( $input['category'] ) : 0;
+		$out['debug']       = empty( $input['debug'] ) ? 0 : 1;
+		$out['show_credit'] = empty( $input['show_credit'] ) ? 0 : 1;
 
 		$interval        = isset( $input['interval'] ) ? sanitize_key( $input['interval'] ) : 'daily';
 		$out['interval'] = array_key_exists( $interval, runningsa_mec_intervals() ) ? $interval : 'daily';
@@ -87,6 +89,20 @@ class RunningSA_MEC_Admin {
 		RunningSA_MEC_API::clear_cache();
 		RunningSA_MEC_Importer::run( 'manual' );
 		wp_safe_redirect( admin_url( 'options-general.php?page=' . self::SLUG . '&runningsa_done=1' ) );
+		exit;
+	}
+
+	public function resync() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'You are not allowed to do this.', 'running-sa-mec' ) );
+		}
+		check_admin_referer( 'runningsa_mec_resync' );
+		if ( function_exists( 'set_time_limit' ) ) {
+			@set_time_limit( 300 ); // phpcs:ignore
+		}
+		RunningSA_MEC_API::clear_cache();
+		RunningSA_MEC_Importer::run( 'resync', true );
+		wp_safe_redirect( admin_url( 'options-general.php?page=' . self::SLUG . '&runningsa_done=resync' ) );
 		exit;
 	}
 
@@ -164,13 +180,18 @@ class RunningSA_MEC_Admin {
 		$interval    = (string) runningsa_mec_get_setting( 'interval' );
 		$category    = (int) runningsa_mec_get_setting( 'category' );
 		$debug       = (int) runningsa_mec_get_setting( 'debug' );
+		$show_credit = (int) runningsa_mec_get_setting( 'show_credit' );
 		$has_const   = defined( 'RUNNINGSA_API_KEY' ) && RUNNINGSA_API_KEY;
 		$has_saved   = '' !== (string) runningsa_mec_get_setting( 'api_key' );
 		$last        = get_option( 'runningsa_mec_last_run' );
 		$next        = wp_next_scheduled( RUNNINGSA_MEC_CRON_HOOK );
 
 		if ( isset( $_GET['runningsa_done'] ) ) { // phpcs:ignore
-			echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__( 'Force fetch finished. See the status below.', 'running-sa-mec' ) . '</p></div>';
+			$done = sanitize_key( wp_unslash( $_GET['runningsa_done'] ) ); // phpcs:ignore
+			$msg  = ( 'resync' === $done )
+				? __( 'Resync finished. Events were rewritten with the latest summary, organiser, logo and canonical URL. Links still use the tracked url exactly as Running Calendar returned it.', 'running-sa-mec' )
+				: __( 'Force fetch finished. See the status below.', 'running-sa-mec' );
+			echo '<div class="notice notice-success is-dismissible"><p>' . esc_html( $msg ) . '</p></div>';
 		}
 		$this->render_import_notice();
 		?>
@@ -208,7 +229,7 @@ class RunningSA_MEC_Admin {
 								<option value="<?php echo esc_attr( $key ); ?>" <?php selected( $interval, $key ); ?>><?php echo esc_html( $choice['label'] ); ?></option>
 							<?php endforeach; ?>
 						</select>
-						<p class="description"><?php esc_html_e( 'How often to fetch races. On each fetch, races Running Calendar reports as no longer available are marked cancelled in MEC. Save settings to apply a new frequency.', 'running-sa-mec' ); ?></p>
+						<p class="description"><?php esc_html_e( 'How often to fetch races. Running Calendar’s terms require a refresh at least once a day, so daily or more often is recommended. On each fetch, races Running Calendar reports as no longer available are marked cancelled in MEC. Save settings to apply a new frequency.', 'running-sa-mec' ); ?></p>
 					</td>
 				</tr>
 				<tr>
@@ -232,6 +253,13 @@ class RunningSA_MEC_Admin {
 						}
 						?>
 						<p class="description"><?php esc_html_e( 'Optional. Added to every imported race.', 'running-sa-mec' ); ?></p>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><?php esc_html_e( 'RunningCalendar credit', 'running-sa-mec' ); ?></th>
+					<td>
+						<label><input type="checkbox" name="runningsa_mec_settings[show_credit]" value="1" <?php checked( $show_credit, 1 ); ?> /> <?php esc_html_e( 'Show the RunningCalendar logo and “Race data from RunningCalendar” on each imported event, linked to its RunningCalendar page.', 'running-sa-mec' ); ?></label>
+						<p class="description"><?php esc_html_e( 'This is added when the event is viewed, so existing events show it without a re-import. On by default.', 'running-sa-mec' ); ?></p>
 					</td>
 				</tr>
 				<tr>
@@ -283,6 +311,13 @@ class RunningSA_MEC_Admin {
 			<?php wp_nonce_field( 'runningsa_mec_force_fetch' ); ?>
 			<?php submit_button( __( 'Force fetch now', 'running-sa-mec' ), 'secondary', 'submit', false ); ?>
 			<span class="description"><?php esc_html_e( 'Clears the 10-minute cache and imports straight away. Save settings first.', 'running-sa-mec' ); ?></span>
+		</form>
+
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="margin-top:1em">
+			<input type="hidden" name="action" value="runningsa_mec_resync" />
+			<?php wp_nonce_field( 'runningsa_mec_resync' ); ?>
+			<?php submit_button( __( 'Resync events', 'running-sa-mec' ), 'secondary', 'submit', false ); ?>
+			<span class="description"><?php esc_html_e( 'Rewrites every race from the API, including the clean canonical URL used to match events. The link on each event stays the tracked url, unchanged.', 'running-sa-mec' ); ?></span>
 		</form>
 
 		<hr />
