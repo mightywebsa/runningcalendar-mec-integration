@@ -71,7 +71,8 @@ class RunningSA_MEC_Admin {
 
 		$out['category']    = isset( $input['category'] ) ? absint( $input['category'] ) : 0;
 		$out['debug']       = empty( $input['debug'] ) ? 0 : 1;
-		$out['show_credit'] = empty( $input['show_credit'] ) ? 0 : 1;
+		$out['show_credit']     = empty( $input['show_credit'] ) ? 0 : 1;
+		$out['restrict_export'] = empty( $input['restrict_export'] ) ? 0 : 1;
 
 		$interval        = isset( $input['interval'] ) ? sanitize_key( $input['interval'] ) : 'daily';
 		$out['interval'] = array_key_exists( $interval, runningsa_mec_intervals() ) ? $interval : 'daily';
@@ -180,7 +181,8 @@ class RunningSA_MEC_Admin {
 		$interval    = (string) runningsa_mec_get_setting( 'interval' );
 		$category    = (int) runningsa_mec_get_setting( 'category' );
 		$debug       = (int) runningsa_mec_get_setting( 'debug' );
-		$show_credit = (int) runningsa_mec_get_setting( 'show_credit' );
+		$show_credit     = (int) runningsa_mec_get_setting( 'show_credit' );
+		$restrict_export = (int) runningsa_mec_get_setting( 'restrict_export' );
 		$has_const   = defined( 'RUNNINGSA_API_KEY' ) && RUNNINGSA_API_KEY;
 		$has_saved   = '' !== (string) runningsa_mec_get_setting( 'api_key' );
 		$last        = get_option( 'runningsa_mec_last_run' );
@@ -229,7 +231,7 @@ class RunningSA_MEC_Admin {
 								<option value="<?php echo esc_attr( $key ); ?>" <?php selected( $interval, $key ); ?>><?php echo esc_html( $choice['label'] ); ?></option>
 							<?php endforeach; ?>
 						</select>
-						<p class="description"><?php esc_html_e( 'How often to fetch races. Running Calendar’s terms require a refresh at least once a day, so daily or more often is recommended. On each fetch, races Running Calendar reports as no longer available are marked cancelled in MEC. Save settings to apply a new frequency.', 'running-sa-mec' ); ?></p>
+						<p class="description"><?php esc_html_e( 'How often to fetch races. Running Calendar’s terms require a refresh at least once a day, so only daily or more often is offered. On each fetch, races Running Calendar reports as no longer available are marked cancelled in MEC. Save settings to apply a new frequency.', 'running-sa-mec' ); ?></p>
 					</td>
 				</tr>
 				<tr>
@@ -260,6 +262,13 @@ class RunningSA_MEC_Admin {
 					<td>
 						<label><input type="checkbox" name="runningsa_mec_settings[show_credit]" value="1" <?php checked( $show_credit, 1 ); ?> /> <?php esc_html_e( 'Show the RunningCalendar logo and “Race data from RunningCalendar” on each imported event, linked to its RunningCalendar page.', 'running-sa-mec' ); ?></label>
 						<p class="description"><?php esc_html_e( 'This is added when the event is viewed, so existing events show it without a re-import. On by default.', 'running-sa-mec' ); ?></p>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><?php esc_html_e( 'Restrict data export', 'running-sa-mec' ); ?></th>
+					<td>
+						<label><input type="checkbox" name="runningsa_mec_settings[restrict_export]" value="1" <?php checked( $restrict_export, 1 ); ?> /> <?php esc_html_e( 'Keep imported RunningCalendar data out of public feeds and the REST API.', 'running-sa-mec' ); ?></label>
+						<p class="description"><?php esc_html_e( 'On by default, to honour Running Calendar’s request not to pass the data on. Visitors cannot read imported events or their meta through the WordPress REST API. Administrators, editors, and anyone who can edit posts (including the MEC editor) still can when they are logged in. The public MEC iCal feed (/?mec-ical-feed=1) is turned off for visitors; this is site-wide, because MEC has no per-event filter for that feed, so any manually created MEC events are also left out of it. Logged-in editors can still use the feed. On imported events, the “Add to Google Calendar” and “iCal / Outlook export” buttons are hidden and their download links will not work for visitors. Imported events are also left out of RSS feeds. Event pages themselves stay public. Turn this off only if you have a reason to republish the imported data.', 'running-sa-mec' ); ?></p>
 					</td>
 				</tr>
 				<tr>

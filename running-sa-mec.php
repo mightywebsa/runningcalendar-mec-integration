@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       Running Calendar integration with MEC
  * Description:       Imports upcoming races from the RunningCalendar API into Modern Events Calendar (MEC) events on a schedule you choose.
- * Version:           1.1.0
+ * Version:           1.1.1
  * Author:            MightyWeb
  * Requires PHP:      7.4
  * Requires at least: 5.8
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'RUNNINGSA_MEC_VERSION', '1.1.0' );
+define( 'RUNNINGSA_MEC_VERSION', '1.1.1' );
 define( 'RUNNINGSA_MEC_FILE', __FILE__ );
 define( 'RUNNINGSA_MEC_DIR', plugin_dir_path( __FILE__ ) );
 define( 'RUNNINGSA_MEC_CRON_HOOK', 'runningsa_mec_daily_fetch' );
@@ -25,6 +25,7 @@ require_once RUNNINGSA_MEC_DIR . 'includes/class-logger.php';
 require_once RUNNINGSA_MEC_DIR . 'includes/class-api.php';
 require_once RUNNINGSA_MEC_DIR . 'includes/class-importer.php';
 require_once RUNNINGSA_MEC_DIR . 'includes/class-admin.php';
+require_once RUNNINGSA_MEC_DIR . 'includes/class-export-lock.php';
 
 /**
  * Import frequencies. Keys are stored in settings; schedule is the WP-Cron name.
@@ -47,11 +48,6 @@ function runningsa_mec_intervals() {
 			'schedule' => 'daily',
 			'seconds'  => DAY_IN_SECONDS,
 			'label'    => __( 'Once a day', 'running-sa-mec' ),
-		),
-		'weekly'       => array(
-			'schedule' => 'weekly',
-			'seconds'  => WEEK_IN_SECONDS,
-			'label'    => __( 'Once a week', 'running-sa-mec' ),
 		),
 	);
 }
@@ -146,7 +142,8 @@ function runningsa_mec_get_setting( $key ) {
 		'interval'    => 'daily',
 		'category'    => 0,
 		'debug'       => 0,
-		'show_credit' => 1,
+		'show_credit'     => 1,
+		'restrict_export' => 1,
 	);
 	$settings = wp_parse_args( (array) get_option( 'runningsa_mec_settings', array() ), $defaults );
 	return isset( $settings[ $key ] ) ? $settings[ $key ] : null;
@@ -301,6 +298,27 @@ function runningsa_mec_enqueue_credit_css() {
 }
 add_action( 'wp_enqueue_scripts', 'runningsa_mec_enqueue_credit_css' );
 
+
+/**
+ * Saved “weekly” frequencies are no longer offered. Move them to daily and
+ * reschedule the cron job to start in five minutes.
+ */
+function runningsa_mec_migrate_weekly_interval() {
+	$settings = get_option( 'runningsa_mec_settings', array() );
+	if ( ! is_array( $settings ) || ! isset( $settings['interval'] ) || 'weekly' !== $settings['interval'] ) {
+		return;
+	}
+
+	$settings['interval'] = 'daily';
+	remove_action( 'update_option_runningsa_mec_settings', 'runningsa_mec_ensure_schedule' );
+	update_option( 'runningsa_mec_settings', $settings );
+	add_action( 'update_option_runningsa_mec_settings', 'runningsa_mec_ensure_schedule' );
+
+	wp_clear_scheduled_hook( RUNNINGSA_MEC_CRON_HOOK );
+	wp_schedule_event( time() + 300, 'daily', RUNNINGSA_MEC_CRON_HOOK );
+}
+
+add_action( 'init', 'runningsa_mec_migrate_weekly_interval', 9 );
 add_action( 'init', 'runningsa_mec_ensure_schedule' );
 add_action( 'update_option_runningsa_mec_settings', 'runningsa_mec_ensure_schedule' );
 add_action( 'add_option_runningsa_mec_settings', 'runningsa_mec_ensure_schedule' );

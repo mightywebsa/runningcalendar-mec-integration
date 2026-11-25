@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1 - 2026-11-25
+
+- Remove the weekly import frequency. A site that was saved as weekly is moved to daily and the cron job is rescheduled to run in five minutes, then once a day.
+- Add a **Restrict data export** setting, on by default. Unauthenticated REST requests no longer expose imported events or their meta; administrators, editors, and anyone who can edit posts (including the MEC editor) still can when logged in. The public MEC iCal feed (`/?mec-ical-feed=1`) is disabled for visitors (site-wide, because MEC has no per-event filter for that feed). On imported events, “Add to Google Calendar” and “iCal / Outlook export” are hidden and their download links are blocked for visitors. Imported events are left out of RSS feeds. Event pages stay public.
+
+
 ## 1.1.0 - 2026-11-25
 
 - Show a “Race data from RunningCalendar” credit with the bundled RunningCalendar logo on each imported event. The logo is an `<img>` linked to the event’s tracked API `url`. This is rendered when the event is viewed, so existing events get it without a database rewrite. A settings toggle turns it off; it is on by default.
